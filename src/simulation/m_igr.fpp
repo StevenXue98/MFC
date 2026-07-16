@@ -19,7 +19,8 @@ module m_igr
 
     private; public :: s_initialize_igr_module, s_igr_iterative_solve, s_igr_compute_jac_rhs, &
         & s_igr_reconstruct_cell_boundary_values, s_igr_reconstruct_cell_boundary_values_visc_deriv, s_igr_riemann_solver, &
-        & s_igr_sigma_x, s_igr_flux_add, s_finalize_igr_module, s_igr_correct_lf_fluxes, s_igr_sigma
+        & s_igr_sigma_x, s_igr_flux_add, s_finalize_igr_module, s_igr_correct_lf_fluxes, s_igr_sigma, &
+        & s_igr_reconstruct_fixed_coeff_boundary_values
 
     !> @cond
 #ifdef __NVCOMPILER_GPU_UNIFIED_MEM
@@ -1197,7 +1198,7 @@ contains
 
     end subroutine s_igr_reconstruct_cell_boundary_values
 
-    subroutine s_igr_compute_jac_rhs(q_cons_vf, dq_prim_dx_vf, dq_prim_dy_vf, dq_prim_dz_vf, idir)
+    subroutine s_igr_compute_jac_rhs(q_cons_vf, dq_prim_dx_vf, dq_prim_dy_vf, dq_prim_dz_vf)
 
 #ifdef _CRAYFTN
         ! DIR$ OPTIMIZE (-haggress)
@@ -1206,11 +1207,8 @@ contains
         type(scalar_field), dimension(sys_size), intent(inout) :: dq_prim_dx_vf
         type(scalar_field), dimension(sys_size), intent(inout) :: dq_prim_dy_vf
         type(scalar_field), dimension(sys_size), intent(inout) :: dq_prim_dz_vf
-        integer, intent(in)                                    :: idir
         real(wp)                                               :: rho_lx, rho_rx, rho_ly, rho_ry, rho_lz, rho_rz
         real(wp)                                               :: dudx, dudy, dudz, dvdx, dvdy, dvdz, dwdx, dwdy, dwdz
-
-        if (idir /= 1) return
 
         $:GPU_PARALLEL_LOOP(collapse=3, private='[j, k, l, r, rho_lx, rho_rx, dudx, dvdx, dwdx]')
         do l = idwbuff(3)%beg, idwbuff(3)%end
@@ -1435,6 +1433,106 @@ contains
         #:endfor
 
     end subroutine s_igr_reconstruct_cell_boundary_values_visc_deriv
+
+    !> Apply the inexpensive fixed-coefficient IGR reconstruction to shared primitive buffers.
+    subroutine s_igr_reconstruct_fixed_coeff_boundary_values(iv_in, v_vf, vL_x, vR_x, idir)
+
+#ifdef _CRAYFTN
+        ! DIR$ OPTIMIZE (-haggress)
+#endif
+        type(int_bounds_info), intent(in)                                                      :: iv_in
+        type(scalar_field), dimension(iv_in%beg:iv_in%end), intent(in)                         :: v_vf
+        real(wp), dimension(idwbuff(1)%beg:,idwbuff(2)%beg:,idwbuff(3)%beg:,1:), intent(inout) :: vL_x
+        real(wp), dimension(idwbuff(1)%beg:,idwbuff(2)%beg:,idwbuff(3)%beg:,1:), intent(inout) :: vR_x
+        integer, intent(in)                                                                    :: idir
+        integer(kind=8)                                                                        :: ii, jj, kk, ll, qq
+        real(wp)                                                                               :: vL, vR
+
+        if (idir == 1) then
+            $:GPU_PARALLEL_LOOP(collapse=4, private='[ii, jj, kk, ll, qq, vL, vR]')
+            do ii = iv_in%beg, iv_in%end
+                do ll = 0, p
+                    do kk = 0, n
+                        do jj = -1, m
+                            vL = 0._wp; vR = 0._wp
+                            #:if MFC_CASE_OPTIMIZATION
+                                #:if igr_order == 5
+                                    ! DIR$ unroll 6
+                                #:elif igr_order == 3
+                                    ! DIR$ unroll 4
+                                #:endif
+                            #:endif
+                            $:GPU_LOOP(parallelism='[seq]')
+                            do qq = vidxb, vidxe
+                                if (qq > vidxb) vL = vL + coeff_L(qq)*v_vf(ii)%sf(jj + qq, kk, ll)
+                                if (qq < vidxe) vR = vR + coeff_R(qq)*v_vf(ii)%sf(jj + qq, kk, ll)
+                            end do
+                            vL_x(jj + 1, kk, ll, ii) = vL
+                            vR_x(jj, kk, ll, ii) = vR
+                        end do
+                    end do
+                end do
+            end do
+            $:END_GPU_PARALLEL_LOOP()
+        else if (idir == 2) then
+            #:if not MFC_CASE_OPTIMIZATION or num_dims > 1
+                $:GPU_PARALLEL_LOOP(collapse=4, private='[ii, jj, kk, ll, qq, vL, vR]')
+                do ii = iv_in%beg, iv_in%end
+                    do ll = 0, p
+                        do kk = -1, n
+                            do jj = 0, m
+                                vL = 0._wp; vR = 0._wp
+                                #:if MFC_CASE_OPTIMIZATION
+                                    #:if igr_order == 5
+                                        ! DIR$ unroll 6
+                                    #:elif igr_order == 3
+                                        ! DIR$ unroll 4
+                                    #:endif
+                                #:endif
+                                $:GPU_LOOP(parallelism='[seq]')
+                                do qq = vidxb, vidxe
+                                    if (qq > vidxb) vL = vL + coeff_L(qq)*v_vf(ii)%sf(jj, kk + qq, ll)
+                                    if (qq < vidxe) vR = vR + coeff_R(qq)*v_vf(ii)%sf(jj, kk + qq, ll)
+                                end do
+                                vL_x(jj, kk + 1, ll, ii) = vL
+                                vR_x(jj, kk, ll, ii) = vR
+                            end do
+                        end do
+                    end do
+                end do
+                $:END_GPU_PARALLEL_LOOP()
+            #:endif
+        else
+            #:if not MFC_CASE_OPTIMIZATION or num_dims > 2
+                $:GPU_PARALLEL_LOOP(collapse=4, private='[ii, jj, kk, ll, qq, vL, vR]')
+                do ii = iv_in%beg, iv_in%end
+                    do ll = -1, p
+                        do kk = 0, n
+                            do jj = 0, m
+                                vL = 0._wp; vR = 0._wp
+                                #:if MFC_CASE_OPTIMIZATION
+                                    #:if igr_order == 5
+                                        ! DIR$ unroll 6
+                                    #:elif igr_order == 3
+                                        ! DIR$ unroll 4
+                                    #:endif
+                                #:endif
+                                $:GPU_LOOP(parallelism='[seq]')
+                                do qq = vidxb, vidxe
+                                    if (qq > vidxb) vL = vL + coeff_L(qq)*v_vf(ii)%sf(jj, kk, ll + qq)
+                                    if (qq < vidxe) vR = vR + coeff_R(qq)*v_vf(ii)%sf(jj, kk, ll + qq)
+                                end do
+                                vL_x(jj, kk, ll + 1, ii) = vL
+                                vR_x(jj, kk, ll, ii) = vR
+                            end do
+                        end do
+                    end do
+                end do
+                $:END_GPU_PARALLEL_LOOP()
+            #:endif
+        end if
+
+    end subroutine s_igr_reconstruct_fixed_coeff_boundary_values
 
     ! Match legacy IGR alpha-flux/source semantics before shared RHS accumulation.
     subroutine s_igr_correct_lf_fluxes(qL_vf, qR_vf, flux_vf, flux_src_vf, idir)

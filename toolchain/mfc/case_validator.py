@@ -1044,8 +1044,10 @@ class CaseValidator:
         hyper_cleaning = self.get("hyper_cleaning", "F") == "T"
         wave_speeds = self.get("wave_speeds")
         n = self.get("n", 0)
+        igr = self.get("igr", "F") == "T"
 
-        self.prohibit(mhd and riemann_solver is not None and riemann_solver not in [1, 4], "MHD simulations require riemann_solver = 1 (HLL) or riemann_solver = 4 (HLLD)")
+        self.prohibit(mhd and riemann_solver is not None and riemann_solver not in [1, 4, 5], "MHD simulations require riemann_solver = 1 (HLL) or riemann_solver = 4 (HLLD)")
+        self.prohibit(mhd and riemann_solver == 5 and not igr, "MHD simulations require riemann_solver = 1 (HLL) or riemann_solver = 4 (HLLD)")
         self.prohibit(mhd and wave_speeds is not None and wave_speeds == 2, "MHD requires wave_speeds = 1")
         self.prohibit(riemann_solver == 4 and not mhd, "HLLD (riemann_solver = 4) is only available for MHD simulations")
         self.prohibit(riemann_solver == 4 and relativity, "HLLD is not available for RMHD (relativity)")
@@ -1072,7 +1074,6 @@ class CaseValidator:
         hypoelasticity = self.get("hypoelasticity", "F") == "T"
         acoustic_source = self.get("acoustic_source", "F") == "T"
         relax = self.get("relax", "F") == "T"
-        mhd = self.get("mhd", "F") == "T"
         hyperelasticity = self.get("hyperelasticity", "F") == "T"
         cyl_coord = self.get("cyl_coord", "F") == "T"
         probe_wrt = self.get("probe_wrt", "F") == "T"
@@ -1092,7 +1093,6 @@ class CaseValidator:
         self.prohibit(hypoelasticity, "IGR does not support hypoelasticity")
         self.prohibit(acoustic_source, "IGR does not support acoustic sources")
         self.prohibit(relax, "IGR does not support phase change")
-        self.prohibit(mhd, "IGR does not support magnetohydrodynamics")
         self.prohibit(hyperelasticity, "IGR does not support hyperelasticity")
         self.prohibit(cyl_coord, "IGR does not support cylindrical or axisymmetric coordinates")
         self.prohibit(probe_wrt, "IGR does not support probe writes")

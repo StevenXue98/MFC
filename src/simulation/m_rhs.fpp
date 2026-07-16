@@ -551,12 +551,17 @@ contains
             $:END_GPU_PARALLEL_LOOP()
         end if
 
-        ! IGR reconstruction still reads conservative ghost-cell data directly.
+        ! IGR-specific helpers still read conservative ghost-cell data directly.
         if (igr) then
-            call nvtxStartRange("RHS-COMMUNICATION")
-            call s_populate_variables_buffers(bc_type, q_cons_vf, pb_in, mv_in, q_T_sf)
+            call nvtxStartRange("IGR-RHS-COMMUNICATION")
+            call s_populate_variables_buffers(bc_type, q_cons_qp%vf, pb_in, mv_in, q_T_sf)
+            call nvtxEndRange
+
+            call nvtxStartRange("IGR-JAC-RHS")
+            call s_igr_compute_jac_rhs(q_cons_qp%vf, dq_prim_dx_qp(1)%vf, dq_prim_dy_qp(1)%vf, dq_prim_dz_qp(1)%vf)
             call nvtxEndRange
         end if
+
         ! q_prim_qp is required by shared LF/advection-source infrastructure.
         call nvtxStartRange("RHS-CONVERT")
         call s_convert_conservative_to_primitive_variables(q_cons_qp%vf, q_T_sf, q_prim_qp%vf, idwint)
@@ -602,124 +607,105 @@ contains
 
         ! Loop over coordinate directions for dimensional splitting
         do id = 1, num_dims
-            if (igr) then
-                if (id == 1) then
-                    call nvtxStartRange("IGR-JAC-RHS")
-                    call s_igr_compute_jac_rhs(q_cons_vf, dq_prim_dx_qp(1)%vf, dq_prim_dy_qp(1)%vf, dq_prim_dz_qp(1)%vf, id)
-                    call nvtxEndRange
-                end if
+            ! Reconstructing Primitive/Conservative Variables
+            call nvtxStartRange("RHS-RECONSTRUCTION")
 
-                ! Reconstruct IGR face states for the shared LF Riemann path.
-                call nvtxStartRange("IGR-RECONSTRUCTION")
-                call s_igr_reconstruct_cell_boundary_values(q_cons_vf, qL_rsx_vf, qR_rsx_vf, id)
-                call nvtxEndRange
-
-                if (viscous) then
-                    call nvtxStartRange("IGR-VISCOUS")
-                    call s_igr_reconstruct_cell_boundary_values_visc_deriv(dqL_prim_dx_n(id)%vf, dqL_prim_dy_n(id)%vf, &
-                        & dqL_prim_dz_n(id)%vf, dqR_prim_dx_n(id)%vf, dqR_prim_dy_n(id)%vf, dqR_prim_dz_n(id)%vf, &
-                        & dq_prim_dx_qp(1)%vf, dq_prim_dy_qp(1)%vf, dq_prim_dz_qp(1)%vf, id)
-                    call nvtxEndRange
-                end if
-            end if
-
-            if (.not. igr) then
-                ! Reconstructing Primitive/Conservative Variables
-                call nvtxStartRange("RHS-RECONSTRUCTION")
-
-                if (.not. surface_tension) then
-                    if ((.not. weno_Re_flux) .or. int_comp > 0) then
-                        ! Reconstruct densitiess
-                        iv%beg = 1; iv%end = sys_size
-                        call s_reconstruct_cell_boundary_values(q_prim_qp%vf(1:sys_size), qL_rsx_vf, qR_rsx_vf, id)
-                    else
-                        iv%beg = 1; iv%end = eqn_idx%cont%end
-                        call s_reconstruct_cell_boundary_values(q_prim_qp%vf(iv%beg:iv%end), qL_rsx_vf, qR_rsx_vf, id)
-
-                        iv%beg = eqn_idx%mom%beg; iv%end = eqn_idx%mom%end; iglob = id
-                        $:GPU_UPDATE(device='[iv, iglob]')
-
-                        $:GPU_PARALLEL_LOOP(collapse=4, private='[i, j, k, l]')
-                        do i = iv%beg, iv%end
-                            do l = idwbuff(3)%beg, idwbuff(3)%end
-                                do k = idwbuff(2)%beg, idwbuff(2)%end
-                                    do j = idwbuff(1)%beg, idwbuff(1)%end
-                                        qL_rsx_vf(j, k, l, i) = qL_prim(iglob)%vf(i)%sf(j, k, l)
-                                        qR_rsx_vf(j, k, l, i) = qR_prim(iglob)%vf(i)%sf(j, k, l)
-                                    end do
-                                end do
-                            end do
-                        end do
-                        $:END_GPU_PARALLEL_LOOP()
-
-                        iv%beg = eqn_idx%E; iv%end = sys_size
-                        call s_reconstruct_cell_boundary_values(q_prim_qp%vf(iv%beg:iv%end), qL_rsx_vf, qR_rsx_vf, id)
-                    end if
+            if (.not. surface_tension) then
+                if ((.not. weno_Re_flux) .or. int_comp > 0 .or. igr) then
+                    ! Reconstruct densitiess
+                    iv%beg = 1; iv%end = sys_size
+                    call s_reconstruct_cell_boundary_values(q_prim_qp%vf(1:sys_size), qL_rsx_vf, qR_rsx_vf, id)
                 else
-                    if (int_comp > 0) then
-                        ! THINC reads cont and adv from v_rs_ws; must reconstruct full sys_size range to populate both
-                        iv%beg = 1; iv%end = sys_size
-                        call s_reconstruct_cell_boundary_values(q_prim_qp%vf(1:sys_size), qL_rsx_vf, qR_rsx_vf, id)
-                        ! Surface tension requires first-order energy; overwrite the higher-order result from the full pass above
-                        iv%beg = eqn_idx%E; iv%end = eqn_idx%E
-                        call s_reconstruct_cell_boundary_values_first_order(q_prim_qp%vf(eqn_idx%E), qL_rsx_vf, qR_rsx_vf, id)
-                    else if ((.not. weno_Re_flux)) then
-                        iv%beg = 1; iv%end = eqn_idx%E - 1
-                        call s_reconstruct_cell_boundary_values(q_prim_qp%vf(iv%beg:iv%end), qL_rsx_vf, qR_rsx_vf, id)
+                    iv%beg = 1; iv%end = eqn_idx%cont%end
+                    call s_reconstruct_cell_boundary_values(q_prim_qp%vf(iv%beg:iv%end), qL_rsx_vf, qR_rsx_vf, id)
 
-                        iv%beg = eqn_idx%E; iv%end = eqn_idx%E
-                        call s_reconstruct_cell_boundary_values_first_order(q_prim_qp%vf(eqn_idx%E), qL_rsx_vf, qR_rsx_vf, id)
+                    iv%beg = eqn_idx%mom%beg; iv%end = eqn_idx%mom%end; iglob = id
+                    $:GPU_UPDATE(device='[iv, iglob]')
 
-                        iv%beg = eqn_idx%E + 1; iv%end = sys_size
-                        call s_reconstruct_cell_boundary_values(q_prim_qp%vf(iv%beg:iv%end), qL_rsx_vf, qR_rsx_vf, id)
-                    else
-                        iv%beg = 1; iv%end = eqn_idx%cont%end
-                        call s_reconstruct_cell_boundary_values(q_prim_qp%vf(iv%beg:iv%end), qL_rsx_vf, qR_rsx_vf, id)
-
-                        iv%beg = eqn_idx%mom%beg; iv%end = eqn_idx%mom%end; iglob = id
-                        $:GPU_UPDATE(device='[iv, iglob]')
-
-                        $:GPU_PARALLEL_LOOP(collapse=4, private='[i, j, k, l]')
-                        do i = iv%beg, iv%end
-                            do l = idwbuff(3)%beg, idwbuff(3)%end
-                                do k = idwbuff(2)%beg, idwbuff(2)%end
-                                    do j = idwbuff(1)%beg, idwbuff(1)%end
-                                        qL_rsx_vf(j, k, l, i) = qL_prim(iglob)%vf(i)%sf(j, k, l)
-                                        qR_rsx_vf(j, k, l, i) = qR_prim(iglob)%vf(i)%sf(j, k, l)
-                                    end do
+                    $:GPU_PARALLEL_LOOP(collapse=4, private='[i, j, k, l]')
+                    do i = iv%beg, iv%end
+                        do l = idwbuff(3)%beg, idwbuff(3)%end
+                            do k = idwbuff(2)%beg, idwbuff(2)%end
+                                do j = idwbuff(1)%beg, idwbuff(1)%end
+                                    qL_rsx_vf(j, k, l, i) = qL_prim(iglob)%vf(i)%sf(j, k, l)
+                                    qR_rsx_vf(j, k, l, i) = qR_prim(iglob)%vf(i)%sf(j, k, l)
                                 end do
                             end do
                         end do
-                        $:END_GPU_PARALLEL_LOOP()
+                    end do
+                    $:END_GPU_PARALLEL_LOOP()
 
-                        iv%beg = eqn_idx%E; iv%end = eqn_idx%E
-                        call s_reconstruct_cell_boundary_values_first_order(q_prim_qp%vf(eqn_idx%E), qL_rsx_vf, qR_rsx_vf, id)
-
-                        iv%beg = eqn_idx%E + 1; iv%end = sys_size
-                        call s_reconstruct_cell_boundary_values(q_prim_qp%vf(iv%beg:iv%end), qL_rsx_vf, qR_rsx_vf, id)
-                    end if
+                    iv%beg = eqn_idx%E; iv%end = sys_size
+                    call s_reconstruct_cell_boundary_values(q_prim_qp%vf(iv%beg:iv%end), qL_rsx_vf, qR_rsx_vf, id)
                 end if
+            else
+                if (int_comp > 0) then
+                    ! THINC reads cont and adv from v_rs_ws; must reconstruct full sys_size range to populate both
+                    iv%beg = 1; iv%end = sys_size
+                    call s_reconstruct_cell_boundary_values(q_prim_qp%vf(1:sys_size), qL_rsx_vf, qR_rsx_vf, id)
+                    ! Surface tension requires first-order energy; overwrite the higher-order result from the full pass above
+                    iv%beg = eqn_idx%E; iv%end = eqn_idx%E
+                    call s_reconstruct_cell_boundary_values_first_order(q_prim_qp%vf(eqn_idx%E), qL_rsx_vf, qR_rsx_vf, id)
+                else if ((.not. weno_Re_flux)) then
+                    iv%beg = 1; iv%end = eqn_idx%E - 1
+                    call s_reconstruct_cell_boundary_values(q_prim_qp%vf(iv%beg:iv%end), qL_rsx_vf, qR_rsx_vf, id)
 
-                ! Reconstruct viscous derivatives for viscosity
-                if (weno_Re_flux) then
-                    iv%beg = eqn_idx%mom%beg; iv%end = eqn_idx%mom%end
-                    call s_reconstruct_cell_boundary_values_visc_deriv(dq_prim_dx_qp(1)%vf(iv%beg:iv%end), dqL_rsx_vf, &
-                        & dqR_rsx_vf, id, dqL_prim_dx_n(id)%vf(iv%beg:iv%end), dqR_prim_dx_n(id)%vf(iv%beg:iv%end), idwbuff(1), &
-                        & idwbuff(2), idwbuff(3))
-                    if (n > 0) then
-                        call s_reconstruct_cell_boundary_values_visc_deriv(dq_prim_dy_qp(1)%vf(iv%beg:iv%end), dqL_rsx_vf, &
-                            & dqR_rsx_vf, id, dqL_prim_dy_n(id)%vf(iv%beg:iv%end), dqR_prim_dy_n(id)%vf(iv%beg:iv%end), &
-                            & idwbuff(1), idwbuff(2), idwbuff(3))
-                        if (p > 0) then
-                            call s_reconstruct_cell_boundary_values_visc_deriv(dq_prim_dz_qp(1)%vf(iv%beg:iv%end), dqL_rsx_vf, &
-                                & dqR_rsx_vf, id, dqL_prim_dz_n(id)%vf(iv%beg:iv%end), dqR_prim_dz_n(id)%vf(iv%beg:iv%end), &
-                                & idwbuff(1), idwbuff(2), idwbuff(3))
-                        end if
-                    end if
+                    iv%beg = eqn_idx%E; iv%end = eqn_idx%E
+                    call s_reconstruct_cell_boundary_values_first_order(q_prim_qp%vf(eqn_idx%E), qL_rsx_vf, qR_rsx_vf, id)
+
+                    iv%beg = eqn_idx%E + 1; iv%end = sys_size
+                    call s_reconstruct_cell_boundary_values(q_prim_qp%vf(iv%beg:iv%end), qL_rsx_vf, qR_rsx_vf, id)
+                else
+                    iv%beg = 1; iv%end = eqn_idx%cont%end
+                    call s_reconstruct_cell_boundary_values(q_prim_qp%vf(iv%beg:iv%end), qL_rsx_vf, qR_rsx_vf, id)
+
+                    iv%beg = eqn_idx%mom%beg; iv%end = eqn_idx%mom%end; iglob = id
+                    $:GPU_UPDATE(device='[iv, iglob]')
+
+                    $:GPU_PARALLEL_LOOP(collapse=4, private='[i, j, k, l]')
+                    do i = iv%beg, iv%end
+                        do l = idwbuff(3)%beg, idwbuff(3)%end
+                            do k = idwbuff(2)%beg, idwbuff(2)%end
+                                do j = idwbuff(1)%beg, idwbuff(1)%end
+                                    qL_rsx_vf(j, k, l, i) = qL_prim(iglob)%vf(i)%sf(j, k, l)
+                                    qR_rsx_vf(j, k, l, i) = qR_prim(iglob)%vf(i)%sf(j, k, l)
+                                end do
+                            end do
+                        end do
+                    end do
+                    $:END_GPU_PARALLEL_LOOP()
+
+                    iv%beg = eqn_idx%E; iv%end = eqn_idx%E
+                    call s_reconstruct_cell_boundary_values_first_order(q_prim_qp%vf(eqn_idx%E), qL_rsx_vf, qR_rsx_vf, id)
+
+                    iv%beg = eqn_idx%E + 1; iv%end = sys_size
+                    call s_reconstruct_cell_boundary_values(q_prim_qp%vf(iv%beg:iv%end), qL_rsx_vf, qR_rsx_vf, id)
                 end if
-
-                call nvtxEndRange
             end if
+
+            ! Reconstruct viscous derivatives for viscosity
+            if (igr .and. viscous) then
+                call s_igr_reconstruct_cell_boundary_values_visc_deriv(dqL_prim_dx_n(id)%vf, dqL_prim_dy_n(id)%vf, &
+                    & dqL_prim_dz_n(id)%vf, dqR_prim_dx_n(id)%vf, dqR_prim_dy_n(id)%vf, dqR_prim_dz_n(id)%vf, &
+                    & dq_prim_dx_qp(1)%vf, dq_prim_dy_qp(1)%vf, dq_prim_dz_qp(1)%vf, id)
+            else if (weno_Re_flux) then
+                iv%beg = eqn_idx%mom%beg; iv%end = eqn_idx%mom%end
+                call s_reconstruct_cell_boundary_values_visc_deriv(dq_prim_dx_qp(1)%vf(iv%beg:iv%end), dqL_rsx_vf, dqR_rsx_vf, &
+                    & id, dqL_prim_dx_n(id)%vf(iv%beg:iv%end), dqR_prim_dx_n(id)%vf(iv%beg:iv%end), idwbuff(1), idwbuff(2), &
+                    & idwbuff(3))
+                if (n > 0) then
+                    call s_reconstruct_cell_boundary_values_visc_deriv(dq_prim_dy_qp(1)%vf(iv%beg:iv%end), dqL_rsx_vf, &
+                        & dqR_rsx_vf, id, dqL_prim_dy_n(id)%vf(iv%beg:iv%end), dqR_prim_dy_n(id)%vf(iv%beg:iv%end), idwbuff(1), &
+                        & idwbuff(2), idwbuff(3))
+                    if (p > 0) then
+                        call s_reconstruct_cell_boundary_values_visc_deriv(dq_prim_dz_qp(1)%vf(iv%beg:iv%end), dqL_rsx_vf, &
+                            & dqR_rsx_vf, id, dqL_prim_dz_n(id)%vf(iv%beg:iv%end), dqR_prim_dz_n(id)%vf(iv%beg:iv%end), &
+                            & idwbuff(1), idwbuff(2), idwbuff(3))
+                    end if
+                end if
+            end if
+
+            call nvtxEndRange
 
             ! Configuring Coordinate Direction Indexes
             if (id == 1) then
@@ -803,7 +789,7 @@ contains
             if (igr) then
                 if (id == 1) then
                     call nvtxStartRange("IGR_Jacobi")
-                    call s_igr_iterative_solve(q_cons_vf, bc_type, t_step)
+                    call s_igr_iterative_solve(q_cons_qp%vf, bc_type, t_step)
                     call nvtxEndRange
                 end if
 
@@ -1639,6 +1625,11 @@ contains
         integer, intent(in) :: norm_dir
         integer :: recon_dir  !< Coordinate direction of the reconstruction
         integer :: i, j, k, l
+
+        if (igr) then
+            call s_igr_reconstruct_fixed_coeff_boundary_values(iv, v_vf, vL_x, vR_x, norm_dir)
+            return
+        end if
 
         #:for SCHEME, TYPE in [('weno','recon_type_weno'), ('muscl','recon_type_muscl')]
             if (recon_type == ${TYPE}$) then
