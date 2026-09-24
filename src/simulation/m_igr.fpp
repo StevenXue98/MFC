@@ -285,8 +285,8 @@ contains
 
                         if (igr_iter_solver == 1) then  ! Jacobi iteration
                             if (num_dims == 1) then
-                                jac(j, k, l) = real((alf_igr/fd_coeff)*(1._wp/dx(j)**2._wp)*(jac_old(j - 1, k, l)/rho_lx + &
-                                    & jac_old(j + 1, k, l)/rho_rx) + real(jac_rhs(j, k, l), kind=wp)/fd_coeff, kind=stp)
+                                jac(j, k, l) = real((alf_igr/fd_coeff)*(1._wp/dx(j)**2._wp)*(jac_old(j - 1, k, &
+                                    & l)/rho_lx + jac_old(j + 1, k, l)/rho_rx) + real(jac_rhs(j, k, l), kind=wp)/fd_coeff, kind=stp)
                             else if (num_dims == 2) then
                                 jac(j, k, l) = real((alf_igr/fd_coeff)*((1._wp/dx(j)**2._wp)*(real(jac_old(j - 1, k, l), &
                                     & kind=wp)/rho_lx + real(jac_old(j + 1, k, l), &
@@ -302,8 +302,8 @@ contains
                             end if
                         else  ! Gauss Seidel iteration
                             if (num_dims == 1) then
-                                jac(j, k, l) = real((alf_igr/fd_coeff)*(1._wp/dx(j)**2._wp)*(jac(j - 1, k, l)/rho_lx + &
-                                    & jac(j + 1, k, l)/rho_rx) + real(jac_rhs(j, k, l), kind=wp)/fd_coeff, kind=stp)
+                                jac(j, k, l) = real((alf_igr/fd_coeff)*(1._wp/dx(j)**2._wp)*(jac(j - 1, k, l)/rho_lx + jac(j + 1, &
+                                    & k, l)/rho_rx) + real(jac_rhs(j, k, l), kind=wp)/fd_coeff, kind=stp)
                             else if (num_dims == 2) then
                                 jac(j, k, l) = real((alf_igr/fd_coeff)*((1._wp/dx(j)**2._wp)*(jac(j - 1, k, &
                                     & l)/rho_lx + jac(j + 1, k, l)/rho_rx) + (1._wp/dy(k)**2._wp)*(jac(j, k - 1, &
@@ -3944,8 +3944,8 @@ contains
         subroutine s_igr_mhd_diagnose_sigma(t_step, stage, diag_start, diag_stop)
 
             integer, intent(in) :: t_step, stage, diag_start, diag_stop
-            integer :: ii, jj, kk, min_j, min_k, min_l, max_j, max_k, max_l, nonfinite
-            real(wp) :: sigma_min, sigma_max, sigma
+            integer             :: ii, jj, kk, min_j, min_k, min_l, max_j, max_k, max_l, nonfinite
+            real(wp)            :: sigma_min, sigma_max, sigma
 
             if (t_step < diag_start .or. t_step > diag_stop) return
 
@@ -3975,8 +3975,8 @@ contains
                 end do
             end do
 
-            write (*,*) 'MHD_COMPARE SIGMA', t_step, stage, sigma_min, min_j, min_k, min_l, &
-                & sigma_max, max_j, max_k, max_l, nonfinite
+            write (*, *) 'MHD_COMPARE SIGMA', t_step, stage, sigma_min, min_j, min_k, min_l, sigma_max, max_j, max_k, max_l, &
+                   & nonfinite
 
         end subroutine s_igr_mhd_diagnose_sigma
     #:endif

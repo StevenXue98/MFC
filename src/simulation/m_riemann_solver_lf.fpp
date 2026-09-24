@@ -473,9 +473,9 @@ contains
                                     $:GPU_LOOP(parallelism='[seq]')
                                     do i = 0, 2
                                         flux_rsx_vf(${SF('')}$, &
-                                                    & eqn_idx%B%beg + i) = (s_M*(vel_R(dir_idx(1))*B%R(i + 1) &
-                                                    & - vel_R(i + 1)*B%R(norm_dir)) - s_P*(vel_L(dir_idx(1))*B%L(i + 1) - vel_L(i &
-                                                    & + 1)*B%L(norm_dir)) + s_M*s_P*(B%L(i + 1) - B%R(i + 1)))/(s_M - s_P)
+                                                    & eqn_idx%B%beg + i) = (s_M*(vel_R(dir_idx(1))*B%R(i + 1) - vel_R(i + 1) &
+                                                    & *B%R(norm_dir)) - s_P*(vel_L(dir_idx(1))*B%L(i + 1) - vel_L(i + 1) &
+                                                    & *B%L(norm_dir)) + s_M*s_P*(B%L(i + 1) - B%R(i + 1)))/(s_M - s_P)
                                     end do
 
                                     if (hyper_cleaning) then
