@@ -36,6 +36,9 @@ module m_rhs
     use m_igr
     use m_thinc
     use m_pressure_relaxation
+    #:if MFC_CASE_OPTIMIZATION and mhd
+        use ieee_arithmetic, only: ieee_is_finite
+    #:endif
 
     implicit none
 
@@ -114,6 +117,19 @@ module m_rhs
 
     integer :: iglob
     $:GPU_DECLARE(create='[iglob]')
+
+    #:if MFC_CASE_OPTIMIZATION and mhd
+        logical :: igr_mhd_debug_enabled = .false.
+        logical :: igr_mhd_debug_first_order = .false.
+        logical :: igr_mhd_debug_face_reported = .false.
+        logical :: mhd_admissibility_check_enabled = .false.
+        integer :: igr_mhd_debug_start = 0
+        integer :: igr_mhd_debug_stop = 0
+        integer :: igr_mhd_debug_budget_step = -1
+        integer :: igr_mhd_debug_target_j = 0
+        integer :: igr_mhd_debug_target_k = 0
+        integer :: igr_mhd_debug_target_l = 0
+    #:endif
 
 contains
 
@@ -485,7 +501,76 @@ contains
 
         call s_initialize_pressure_relaxation_module
 
+        #:if MFC_CASE_OPTIMIZATION and mhd
+            call s_igr_mhd_initialize_debug
+        #:endif
+
     end subroutine s_initialize_rhs_module
+
+    #:if MFC_CASE_OPTIMIZATION and mhd
+        ! Local experimental controls. Environment variables avoid exposing
+        ! diagnostic-only switches through MFC's public case-parameter schema.
+        subroutine s_igr_mhd_initialize_debug
+
+            call s_igr_mhd_read_env_logical('MFC_IGR_MHD_DEBUG', igr_mhd_debug_enabled)
+            call s_igr_mhd_read_env_logical('MFC_IGR_MHD_FIRST_ORDER', igr_mhd_debug_first_order)
+            call s_igr_mhd_read_env_logical('MFC_MHD_ADMISSIBILITY_CHECK', mhd_admissibility_check_enabled)
+            call s_igr_mhd_read_env_integer('MFC_IGR_MHD_DEBUG_START', igr_mhd_debug_start)
+            call s_igr_mhd_read_env_integer('MFC_IGR_MHD_DEBUG_STOP', igr_mhd_debug_stop)
+            call s_igr_mhd_read_env_integer('MFC_IGR_MHD_DEBUG_BUDGET_STEP', igr_mhd_debug_budget_step)
+            call s_igr_mhd_read_env_integer('MFC_IGR_MHD_DEBUG_TARGET_J', igr_mhd_debug_target_j)
+            call s_igr_mhd_read_env_integer('MFC_IGR_MHD_DEBUG_TARGET_K', igr_mhd_debug_target_k)
+            call s_igr_mhd_read_env_integer('MFC_IGR_MHD_DEBUG_TARGET_L', igr_mhd_debug_target_l)
+
+            igr_mhd_debug_face_reported = .false.
+
+            if (igr_mhd_debug_enabled .and. proc_rank == 0) then
+                write (*,*) 'IGR_MHD_DEBUG CONFIG', igr_mhd_debug_start, igr_mhd_debug_stop, &
+                    & igr_mhd_debug_budget_step, igr_mhd_debug_target_j, igr_mhd_debug_target_k, &
+                    & igr_mhd_debug_target_l, igr_mhd_debug_first_order
+                if (num_procs /= 1) write (*,*) 'IGR_MHD_DEBUG WARNING diagnostics are intended for one MPI rank'
+            end if
+
+            if (mhd_admissibility_check_enabled .and. proc_rank == 0) then
+                write (*,*) 'MHD_ADMISSIBILITY_CHECK enabled'
+                if (num_procs /= 1) write (*,*) 'MHD_ADMISSIBILITY_CHECK WARNING check is intended for one MPI rank'
+            end if
+
+        end subroutine s_igr_mhd_initialize_debug
+
+        subroutine s_igr_mhd_read_env_logical(name, value)
+
+            character(len=*), intent(in) :: name
+            logical, intent(inout) :: value
+            character(len=32) :: text
+            integer :: status
+
+            call get_environment_variable(name, text, status=status)
+            if (status /= 0) return
+
+            select case (trim(adjustl(text)))
+                case ('1', 'T', 't', 'TRUE', 'true', 'True', 'YES', 'yes', 'Yes')
+                    value = .true.
+                case ('0', 'F', 'f', 'FALSE', 'false', 'False', 'NO', 'no', 'No')
+                    value = .false.
+            end select
+
+        end subroutine s_igr_mhd_read_env_logical
+
+        subroutine s_igr_mhd_read_env_integer(name, value)
+
+            character(len=*), intent(in) :: name
+            integer, intent(inout) :: value
+            character(len=32) :: text
+            integer :: status, io_status, parsed_value
+
+            call get_environment_variable(name, text, status=status)
+            if (status /= 0) return
+            read (text, *, iostat=io_status) parsed_value
+            if (io_status == 0) value = parsed_value
+
+        end subroutine s_igr_mhd_read_env_integer
+    #:endif
 
     !> Compute the right-hand side of the semi-discrete governing equations for a single time stage
     impure subroutine s_compute_rhs(q_cons_vf, q_T_sf, q_prim_vf, bc_type, rhs_vf, pb_in, rhs_pb, mv_in, rhs_mv, t_step, &
@@ -566,6 +651,12 @@ contains
         call nvtxStartRange("RHS-CONVERT")
         call s_convert_conservative_to_primitive_variables(q_cons_qp%vf, q_T_sf, q_prim_qp%vf, idwint)
         call nvtxEndRange
+
+        #:if MFC_CASE_OPTIMIZATION and mhd
+            call s_mhd_check_cell_admissibility(q_cons_qp%vf, q_prim_qp%vf, t_step, stage)
+            call s_igr_mhd_diagnose_cells(q_cons_qp%vf, q_prim_qp%vf, t_step, stage)
+            call s_igr_mhd_diagnose_budget_state(q_cons_qp%vf, t_step, stage)
+        #:endif
 
         call nvtxStartRange("RHS-COMMUNICATION")
         call s_populate_variables_buffers(bc_type, q_prim_qp%vf, pb_in, mv_in, q_T_sf)
@@ -683,6 +774,11 @@ contains
                 end if
             end if
 
+            #:if MFC_CASE_OPTIMIZATION and mhd
+                call s_mhd_check_face_admissibility(qL_rsx_vf, qR_rsx_vf, id, t_step, stage)
+                call s_igr_mhd_diagnose_faces(qL_rsx_vf, qR_rsx_vf, id, t_step, stage)
+            #:endif
+
             ! Reconstruct viscous derivatives for viscosity
             if (igr .and. viscous) then
                 call s_igr_reconstruct_cell_boundary_values_visc_deriv(dqL_prim_dx_n(id)%vf, dqL_prim_dy_n(id)%vf, &
@@ -724,6 +820,10 @@ contains
                                   & q_prim_qp%vf, flux_n(id)%vf, flux_src_n(id)%vf, flux_gsrc_n(id)%vf, id, irx, iry, irz)
             call nvtxEndRange
 
+            #:if MFC_CASE_OPTIMIZATION and mhd
+                call s_igr_mhd_diagnose_flux(flux_n(id)%vf, id, t_step, stage)
+            #:endif
+
             ! Match legacy IGR alpha-flux/source semantics before shared RHS accumulation.
             if (igr) then
                 call nvtxStartRange("IGR-CORRECT-LF-FLUXES")
@@ -735,6 +835,10 @@ contains
             call nvtxStartRange("RHS-ADVECTION-SRC")
             call s_compute_advection_source_term(id, rhs_vf, q_cons_qp, q_prim_qp, flux_src_n(id))
             call nvtxEndRange
+
+            #:if MFC_CASE_OPTIMIZATION and mhd
+                call s_igr_mhd_diagnose_budget_rhs('HYPERBOLIC', q_cons_qp%vf, rhs_vf, id, t_step, stage)
+            #:endif
 
             ! RHS additions for hypoelasticity
             call nvtxStartRange("RHS-HYPOELASTICITY")
@@ -754,6 +858,7 @@ contains
                 call s_compute_additional_physics_rhs(id, q_prim_qp%vf, rhs_vf, flux_src_n(id)%vf, dq_prim_dx_qp(1)%vf, &
                                                       & dq_prim_dy_qp(1)%vf, dq_prim_dz_qp(1)%vf)
                 call nvtxEndRange
+
             end if
 
             ! Bubble dynamics source terms
@@ -776,7 +881,7 @@ contains
                 do l = 0, p
                     do k = 0, n
                         do j = 0, m
-                            rhs_vf(eqn_idx%psi)%sf(j, k, l) = rhs_vf(eqn_idx%psi)%sf(j, k, l) - q_prim_vf(eqn_idx%psi)%sf(j, k, &
+                            rhs_vf(eqn_idx%psi)%sf(j, k, l) = rhs_vf(eqn_idx%psi)%sf(j, k, l) - q_prim_qp%vf(eqn_idx%psi)%sf(j, k, &
                                    & l)/hyper_cleaning_tau
                         end do
                     end do
@@ -790,6 +895,11 @@ contains
                 if (id == 1) then
                     call nvtxStartRange("IGR_Jacobi")
                     call s_igr_iterative_solve(q_cons_qp%vf, bc_type, t_step)
+                    #:if MFC_CASE_OPTIMIZATION and igr and mhd
+                        if (igr_mhd_debug_enabled) then
+                            call s_igr_mhd_diagnose_sigma(t_step, stage, igr_mhd_debug_start, igr_mhd_debug_stop)
+                        end if
+                    #:endif
                     call nvtxEndRange
                 end if
 
@@ -801,6 +911,10 @@ contains
                 call s_compute_additional_physics_rhs(id, q_prim_qp%vf, rhs_vf, flux_src_n(id)%vf, dq_prim_dx_qp(1)%vf, &
                                                       & dq_prim_dy_qp(1)%vf, dq_prim_dz_qp(1)%vf)
                 call nvtxEndRange
+
+                #:if MFC_CASE_OPTIMIZATION and igr and mhd
+                    call s_igr_mhd_diagnose_budget_rhs('SIGMA', q_cons_qp%vf, rhs_vf, id, t_step, stage)
+                #:endif
             end if
             ! END: Additional physics and source terms
         end do
@@ -860,20 +974,17 @@ contains
         ! END: Additional physics and source terms
 
         if (run_time_info .or. probe_wrt .or. ib .or. bubbles_lagrange) then
-            ! IGR keeps q_prim_vf on its native path until primitive workspace semantics are fully integrated.
-            if (.not. igr) then
-                $:GPU_PARALLEL_LOOP(private='[i, j, k, l]', collapse=4)
-                do i = 1, sys_size
-                    do l = idwbuff(3)%beg, idwbuff(3)%end
-                        do k = idwbuff(2)%beg, idwbuff(2)%end
-                            do j = idwbuff(1)%beg, idwbuff(1)%end
-                                q_prim_vf(i)%sf(j, k, l) = q_prim_qp%vf(i)%sf(j, k, l)
-                            end do
+            $:GPU_PARALLEL_LOOP(private='[i, j, k, l]', collapse=4)
+            do i = 1, sys_size
+                do l = idwbuff(3)%beg, idwbuff(3)%end
+                    do k = idwbuff(2)%beg, idwbuff(2)%end
+                        do j = idwbuff(1)%beg, idwbuff(1)%end
+                            q_prim_vf(i)%sf(j, k, l) = q_prim_qp%vf(i)%sf(j, k, l)
                         end do
                     end do
                 end do
-                $:END_GPU_PARALLEL_LOOP()
-            end if
+            end do
+            $:END_GPU_PARALLEL_LOOP()
         end if
 
         call cpu_time(t_finish)
@@ -887,6 +998,446 @@ contains
         call nvtxEndRange
 
     end subroutine s_compute_rhs
+
+    #:if MFC_CASE_OPTIMIZATION and mhd
+        ! Lightweight, opt-in admissibility checks. These scan every current
+        ! RK-stage cell and reconstructed face, but only write on failure.
+        subroutine s_mhd_check_cell_admissibility(q_cons_vf, q_prim_vf, t_step, stage)
+
+            type(scalar_field), dimension(sys_size), intent(in) :: q_cons_vf, q_prim_vf
+            integer, intent(in)                                 :: t_step, stage
+            integer                                             :: ii, jj, kk, ll
+            real(wp), dimension(sys_size)                       :: state
+            real(wp)                                            :: rho, pres, kinetic, magnetic, margin
+
+            if (.not. mhd_admissibility_check_enabled) return
+
+            do ll = 0, p
+                do kk = 0, n
+                    do jj = 0, m
+                        rho = 0._wp
+                        do ii = eqn_idx%cont%beg, eqn_idx%cont%end
+                            rho = rho + q_prim_vf(ii)%sf(jj, kk, ll)
+                        end do
+                        pres = q_prim_vf(eqn_idx%E)%sf(jj, kk, ll)
+                        do ii = 1, sys_size
+                            state(ii) = real(q_cons_vf(ii)%sf(jj, kk, ll), wp)
+                        end do
+                        call s_igr_mhd_budget_margin(state, rho, kinetic, magnetic, margin)
+
+                        if (.not. ieee_is_finite(rho) .or. .not. ieee_is_finite(pres) .or. &
+                            & .not. ieee_is_finite(margin) .or. rho <= 0._wp .or. pres <= 0._wp .or. margin <= 0._wp) then
+                            write (*,*) 'MHD_ADMISSIBILITY_FAILURE CELL', t_step, stage, jj, kk, ll, rho, pres, margin
+                            call s_mpi_abort('MHD cell state is not admissible.')
+                        end if
+                    end do
+                end do
+            end do
+
+        end subroutine s_mhd_check_cell_admissibility
+
+        subroutine s_mhd_check_face_admissibility(qL_vf, qR_vf, idir, t_step, stage)
+
+            real(wp), dimension(idwbuff(1)%beg:,idwbuff(2)%beg:,idwbuff(3)%beg:,1:), intent(in) :: qL_vf, qR_vf
+            integer, intent(in) :: idir, t_step, stage
+            integer             :: ii, jj, kk, ll
+            real(wp)            :: rho_L, rho_R, pres_L, pres_R
+
+            if (.not. mhd_admissibility_check_enabled) return
+
+            if (idir == 1) then
+                do ll = 0, p
+                    do kk = 0, n
+                        do jj = 0, m - 1
+                            rho_L = 0._wp; rho_R = 0._wp
+                            do ii = eqn_idx%cont%beg, eqn_idx%cont%end
+                                rho_L = rho_L + qR_vf(jj, kk, ll, ii)
+                                rho_R = rho_R + qL_vf(jj + 1, kk, ll, ii)
+                            end do
+                            pres_L = qR_vf(jj, kk, ll, eqn_idx%E)
+                            pres_R = qL_vf(jj + 1, kk, ll, eqn_idx%E)
+                            call s_mhd_assert_face_admissibility(rho_L, rho_R, pres_L, pres_R, idir, t_step, stage, jj, kk, ll)
+                        end do
+                    end do
+                end do
+            else
+                do ll = 0, p
+                    do kk = 0, n - 1
+                        do jj = 0, m
+                            rho_L = 0._wp; rho_R = 0._wp
+                            do ii = eqn_idx%cont%beg, eqn_idx%cont%end
+                                rho_L = rho_L + qR_vf(jj, kk, ll, ii)
+                                rho_R = rho_R + qL_vf(jj, kk + 1, ll, ii)
+                            end do
+                            pres_L = qR_vf(jj, kk, ll, eqn_idx%E)
+                            pres_R = qL_vf(jj, kk + 1, ll, eqn_idx%E)
+                            call s_mhd_assert_face_admissibility(rho_L, rho_R, pres_L, pres_R, idir, t_step, stage, jj, kk, ll)
+                        end do
+                    end do
+                end do
+            end if
+
+        end subroutine s_mhd_check_face_admissibility
+
+        subroutine s_mhd_assert_face_admissibility(rho_L, rho_R, pres_L, pres_R, idir, t_step, stage, jj, kk, ll)
+
+            real(wp), intent(in) :: rho_L, rho_R, pres_L, pres_R
+            integer, intent(in)  :: idir, t_step, stage, jj, kk, ll
+
+            if (.not. ieee_is_finite(rho_L) .or. .not. ieee_is_finite(rho_R) .or. &
+                & .not. ieee_is_finite(pres_L) .or. .not. ieee_is_finite(pres_R) .or. &
+                & rho_L <= 0._wp .or. rho_R <= 0._wp .or. pres_L <= 0._wp .or. pres_R <= 0._wp) then
+                write (*,*) 'MHD_ADMISSIBILITY_FAILURE FACE', t_step, stage, idir, jj, kk, ll, &
+                    & rho_L, rho_R, pres_L, pres_R
+                call s_mpi_abort('MHD reconstructed face state is not admissible.')
+            end if
+
+        end subroutine s_mhd_assert_face_admissibility
+
+        ! Opt-in one-rank CPU diagnostics for comparing case-optimized MHD schemes.
+        subroutine s_igr_mhd_diagnose_cells(q_cons_vf, q_prim_vf, t_step, stage)
+
+            type(scalar_field), dimension(sys_size), intent(in) :: q_cons_vf, q_prim_vf
+            integer, intent(in)                                 :: t_step, stage
+            integer :: ii, jj, kk, ll, rho_j, rho_k, rho_l, pres_j, pres_k, pres_l
+            integer :: margin_j, margin_k, margin_l, divb_j, divb_k, divb_l, nonfinite
+            real(wp), dimension(sys_size) :: state
+            real(wp) :: rho, pres, rho_min, pres_min, kinetic, magnetic, margin, margin_min
+            real(wp) :: divb, divb_max, psi_max, target_rho, target_kinetic, target_magnetic, target_margin
+
+            if (.not. igr_mhd_debug_enabled) return
+            if (t_step < igr_mhd_debug_start .or. t_step > igr_mhd_debug_stop) return
+
+            rho_min = huge(0._wp)
+            pres_min = huge(0._wp)
+            margin_min = huge(0._wp)
+            divb_max = 0._wp
+            psi_max = 0._wp
+            nonfinite = 0
+            rho_j = 0; rho_k = 0; rho_l = 0
+            pres_j = 0; pres_k = 0; pres_l = 0
+            margin_j = 0; margin_k = 0; margin_l = 0
+            divb_j = 0; divb_k = 0; divb_l = 0
+
+            do ll = 0, p
+                do kk = 0, n
+                    do jj = 0, m
+                        rho = 0._wp
+                        do ii = eqn_idx%cont%beg, eqn_idx%cont%end
+                            rho = rho + q_prim_vf(ii)%sf(jj, kk, ll)
+                        end do
+                        pres = q_prim_vf(eqn_idx%E)%sf(jj, kk, ll)
+                        do ii = 1, sys_size
+                            state(ii) = real(q_cons_vf(ii)%sf(jj, kk, ll), wp)
+                        end do
+                        call s_igr_mhd_budget_margin(state, rho, kinetic, magnetic, margin)
+
+                        divb = 0._wp
+                        if (jj > 0 .and. jj < m) then
+                            divb = divb + (q_cons_vf(eqn_idx%B%beg)%sf(jj + 1, kk, ll) - &
+                                & q_cons_vf(eqn_idx%B%beg)%sf(jj - 1, kk, ll))/(2._wp*dx(jj))
+                        end if
+                        if (kk > 0 .and. kk < n) then
+                            divb = divb + (q_cons_vf(eqn_idx%B%beg + 1)%sf(jj, kk + 1, ll) - &
+                                & q_cons_vf(eqn_idx%B%beg + 1)%sf(jj, kk - 1, ll))/(2._wp*dy(kk))
+                        end if
+                        if (hyper_cleaning) psi_max = max(psi_max, abs(q_cons_vf(eqn_idx%psi)%sf(jj, kk, ll)))
+
+                        if (.not. ieee_is_finite(rho) .or. .not. ieee_is_finite(pres) .or. &
+                            & .not. ieee_is_finite(margin) .or. .not. ieee_is_finite(divb)) then
+                            nonfinite = nonfinite + 1
+                        else
+                            if (rho < rho_min) then
+                                rho_min = rho
+                                rho_j = jj; rho_k = kk; rho_l = ll
+                            end if
+                            if (pres < pres_min) then
+                                pres_min = pres
+                                pres_j = jj; pres_k = kk; pres_l = ll
+                            end if
+                            if (margin < margin_min) then
+                                margin_min = margin
+                                margin_j = jj; margin_k = kk; margin_l = ll
+                            end if
+                            if (abs(divb) > divb_max) then
+                                divb_max = abs(divb)
+                                divb_j = jj; divb_k = kk; divb_l = ll
+                            end if
+                        end if
+                    end do
+                end do
+            end do
+
+            do ii = 1, sys_size
+                state(ii) = real(q_cons_vf(ii)%sf(igr_mhd_debug_target_j, igr_mhd_debug_target_k, &
+                    & igr_mhd_debug_target_l), wp)
+            end do
+            call s_igr_mhd_budget_margin(state, target_rho, target_kinetic, target_magnetic, target_margin)
+
+            write (*,*) 'MHD_COMPARE CELL', t_step, stage, rho_min, rho_j, rho_k, rho_l, &
+                & pres_min, pres_j, pres_k, pres_l, margin_min, margin_j, margin_k, margin_l, nonfinite
+            write (*,*) 'MHD_COMPARE FIELD', t_step, stage, divb_max, divb_j, divb_k, divb_l, psi_max
+            write (*,*) 'MHD_COMPARE TARGET', t_step, stage, target_rho, state(eqn_idx%E), target_kinetic, &
+                & target_magnetic, target_margin, q_prim_vf(eqn_idx%E)%sf(igr_mhd_debug_target_j, &
+                & igr_mhd_debug_target_k, igr_mhd_debug_target_l)
+
+        end subroutine s_igr_mhd_diagnose_cells
+
+        subroutine s_igr_mhd_diagnose_faces(qL_vf, qR_vf, idir, t_step, stage)
+
+            real(wp), dimension(idwbuff(1)%beg:,idwbuff(2)%beg:,idwbuff(3)%beg:,1:), intent(in) :: qL_vf, qR_vf
+            integer, intent(in) :: idir, t_step, stage
+            integer :: ii, jj, kk, ll, ss, nonfinite, bad_j, bad_k, bad_l
+            integer, dimension(4, 3) :: min_loc
+            real(wp), dimension(4) :: min_value
+            real(wp) :: rho_L, rho_R, pres_L, pres_R
+            logical :: bad_face
+
+            if (.not. igr_mhd_debug_enabled) return
+            if (t_step < igr_mhd_debug_start .or. t_step > igr_mhd_debug_stop) return
+
+            min_value = huge(0._wp)
+            min_loc = 0
+            nonfinite = 0
+            bad_face = .false.
+            bad_j = 0; bad_k = 0; bad_l = 0
+
+            if (idir == 1) then
+                do ll = 0, p
+                    do kk = 0, n
+                        do jj = 0, m - 1
+                            rho_L = 0._wp; rho_R = 0._wp
+                            do ii = eqn_idx%cont%beg, eqn_idx%cont%end
+                                rho_L = rho_L + qR_vf(jj, kk, ll, ii)
+                                rho_R = rho_R + qL_vf(jj + 1, kk, ll, ii)
+                            end do
+                            pres_L = qR_vf(jj, kk, ll, eqn_idx%E)
+                            pres_R = qL_vf(jj + 1, kk, ll, eqn_idx%E)
+                            call s_igr_mhd_update_face_diag(rho_L, rho_R, pres_L, pres_R, jj, kk, ll, &
+                                & min_value, min_loc, nonfinite, bad_face, bad_j, bad_k, bad_l)
+                        end do
+                    end do
+                end do
+            else
+                do ll = 0, p
+                    do kk = 0, n - 1
+                        do jj = 0, m
+                            rho_L = 0._wp; rho_R = 0._wp
+                            do ii = eqn_idx%cont%beg, eqn_idx%cont%end
+                                rho_L = rho_L + qR_vf(jj, kk, ll, ii)
+                                rho_R = rho_R + qL_vf(jj, kk + 1, ll, ii)
+                            end do
+                            pres_L = qR_vf(jj, kk, ll, eqn_idx%E)
+                            pres_R = qL_vf(jj, kk + 1, ll, eqn_idx%E)
+                            call s_igr_mhd_update_face_diag(rho_L, rho_R, pres_L, pres_R, jj, kk, ll, &
+                                & min_value, min_loc, nonfinite, bad_face, bad_j, bad_k, bad_l)
+                        end do
+                    end do
+                end do
+            end if
+
+            write (*,*) 'MHD_COMPARE FACE', t_step, stage, idir, min_value(1), min_loc(1, :), &
+                & min_value(2), min_loc(2, :), min_value(3), min_loc(3, :), min_value(4), min_loc(4, :), nonfinite
+
+            if (bad_face .and. .not. igr_mhd_debug_face_reported) then
+                igr_mhd_debug_face_reported = .true.
+                write (*,*) 'MHD_COMPARE FIRST_BAD_FACE', t_step, stage, idir, bad_j, bad_k, bad_l
+                if (idir == 1) then
+                    do ss = max(0, bad_j - 2), min(m - 1, bad_j + 2)
+                        write (*,*) 'MHD_COMPARE FACE_STENCIL', ss, bad_k, bad_l, &
+                            & qR_vf(ss, bad_k, bad_l, eqn_idx%cont%beg), qL_vf(ss + 1, bad_k, bad_l, eqn_idx%cont%beg), &
+                            & qR_vf(ss, bad_k, bad_l, eqn_idx%E), qL_vf(ss + 1, bad_k, bad_l, eqn_idx%E)
+                    end do
+                    do ii = 1, sys_size
+                        write (*,*) 'MHD_COMPARE BAD_STATE', ii, qR_vf(bad_j, bad_k, bad_l, ii), &
+                            & qL_vf(bad_j + 1, bad_k, bad_l, ii)
+                    end do
+                else
+                    do ss = max(0, bad_k - 2), min(n - 1, bad_k + 2)
+                        write (*,*) 'MHD_COMPARE FACE_STENCIL', bad_j, ss, bad_l, &
+                            & qR_vf(bad_j, ss, bad_l, eqn_idx%cont%beg), qL_vf(bad_j, ss + 1, bad_l, eqn_idx%cont%beg), &
+                            & qR_vf(bad_j, ss, bad_l, eqn_idx%E), qL_vf(bad_j, ss + 1, bad_l, eqn_idx%E)
+                    end do
+                    do ii = 1, sys_size
+                        write (*,*) 'MHD_COMPARE BAD_STATE', ii, qR_vf(bad_j, bad_k, bad_l, ii), &
+                            & qL_vf(bad_j, bad_k + 1, bad_l, ii)
+                    end do
+                end if
+            end if
+
+        end subroutine s_igr_mhd_diagnose_faces
+
+        subroutine s_igr_mhd_update_face_diag(rho_L, rho_R, pres_L, pres_R, jj, kk, ll, min_value, min_loc, &
+                                               & nonfinite, bad_face, bad_j, bad_k, bad_l)
+
+            real(wp), intent(in) :: rho_L, rho_R, pres_L, pres_R
+            integer, intent(in) :: jj, kk, ll
+            real(wp), dimension(4), intent(inout) :: min_value
+            integer, dimension(4, 3), intent(inout) :: min_loc
+            integer, intent(inout) :: nonfinite, bad_j, bad_k, bad_l
+            logical, intent(inout) :: bad_face
+            real(wp), dimension(4) :: value
+            integer :: ii
+
+            value = [rho_L, rho_R, pres_L, pres_R]
+            do ii = 1, 4
+                if (.not. ieee_is_finite(value(ii))) then
+                    nonfinite = nonfinite + 1
+                else if (value(ii) < min_value(ii)) then
+                    min_value(ii) = value(ii)
+                    min_loc(ii, :) = [jj, kk, ll]
+                end if
+            end do
+
+            if (.not. bad_face) then
+                if ((.not. ieee_is_finite(rho_L)) .or. (.not. ieee_is_finite(rho_R)) .or. &
+                    & (.not. ieee_is_finite(pres_L)) .or. (.not. ieee_is_finite(pres_R)) .or. &
+                    & rho_L <= 0._wp .or. rho_R <= 0._wp .or. pres_L <= 0._wp .or. pres_R <= 0._wp) then
+                    bad_face = .true.
+                    bad_j = jj; bad_k = kk; bad_l = ll
+                end if
+            end if
+
+        end subroutine s_igr_mhd_update_face_diag
+
+        subroutine s_igr_mhd_diagnose_flux(flux_vf, idir, t_step, stage)
+
+            type(scalar_field), dimension(sys_size), intent(in) :: flux_vf
+            integer, intent(in) :: idir, t_step, stage
+            integer :: ii, jj, kk, ll, nonfinite, first_i, first_j, first_k, first_l
+            real(wp) :: max_abs_flux, value
+
+            if (.not. igr_mhd_debug_enabled) return
+            if (t_step < igr_mhd_debug_start .or. t_step > igr_mhd_debug_stop) return
+
+            nonfinite = 0
+            max_abs_flux = 0._wp
+            first_i = 0; first_j = 0; first_k = 0; first_l = 0
+
+            do ii = 1, sys_size
+                if (idir == 1) then
+                    do ll = 0, p
+                        do kk = 0, n
+                            do jj = -1, m
+                                value = flux_vf(ii)%sf(jj, kk, ll)
+                                call s_igr_mhd_update_flux_diag(value, ii, jj, kk, ll, max_abs_flux, nonfinite, &
+                                    & first_i, first_j, first_k, first_l)
+                            end do
+                        end do
+                    end do
+                else
+                    do ll = 0, p
+                        do kk = -1, n
+                            do jj = 0, m
+                                value = flux_vf(ii)%sf(jj, kk, ll)
+                                call s_igr_mhd_update_flux_diag(value, ii, jj, kk, ll, max_abs_flux, nonfinite, &
+                                    & first_i, first_j, first_k, first_l)
+                            end do
+                        end do
+                    end do
+                end if
+            end do
+
+            write (*,*) 'MHD_COMPARE FLUX', t_step, stage, idir, max_abs_flux, nonfinite, &
+                & first_i, first_j, first_k, first_l
+
+        end subroutine s_igr_mhd_diagnose_flux
+
+        subroutine s_igr_mhd_update_flux_diag(value, ii, jj, kk, ll, max_abs_flux, nonfinite, &
+                                               & first_i, first_j, first_k, first_l)
+
+            real(wp), intent(in) :: value
+            integer, intent(in) :: ii, jj, kk, ll
+            real(wp), intent(inout) :: max_abs_flux
+            integer, intent(inout) :: nonfinite, first_i, first_j, first_k, first_l
+
+            if (ieee_is_finite(value)) then
+                max_abs_flux = max(max_abs_flux, abs(value))
+            else
+                nonfinite = nonfinite + 1
+                if (first_i == 0) then
+                    first_i = ii; first_j = jj; first_k = kk; first_l = ll
+                end if
+            end if
+
+        end subroutine s_igr_mhd_update_flux_diag
+
+        subroutine s_igr_mhd_diagnose_budget_state(q_cons_vf, t_step, stage)
+
+            type(scalar_field), dimension(sys_size), intent(in) :: q_cons_vf
+            integer, intent(in)                                 :: t_step, stage
+            integer                                             :: ii
+            real(wp), dimension(sys_size)                       :: state
+            real(wp)                                            :: rho, kinetic, magnetic, margin
+
+            if (.not. igr_mhd_debug_enabled) return
+            if (t_step /= igr_mhd_debug_budget_step .or. stage /= 1) return
+
+            do ii = 1, sys_size
+                state(ii) = real(q_cons_vf(ii)%sf(igr_mhd_debug_target_j, igr_mhd_debug_target_k, &
+                    & igr_mhd_debug_target_l), wp)
+                write (*,*) 'MHD_COMPARE BUDGET_STATE_VAR', ii, state(ii)
+            end do
+
+            call s_igr_mhd_budget_margin(state, rho, kinetic, magnetic, margin)
+            write (*,*) 'MHD_COMPARE BUDGET_STATE', t_step, stage, igr_mhd_debug_target_j, &
+                & igr_mhd_debug_target_k, igr_mhd_debug_target_l, &
+                & rho, state(eqn_idx%E), kinetic, magnetic, margin
+
+        end subroutine s_igr_mhd_diagnose_budget_state
+
+        subroutine s_igr_mhd_diagnose_budget_rhs(label, q_cons_vf, rhs_vf, idir, t_step, stage)
+
+            character(len=*), intent(in)                        :: label
+            type(scalar_field), dimension(sys_size), intent(in) :: q_cons_vf, rhs_vf
+            integer, intent(in)                                 :: idir, t_step, stage
+            integer                                             :: ii
+            real(wp), dimension(sys_size)                       :: state, delta, updated
+            real(wp)                                            :: rho, kinetic, magnetic, margin
+
+            if (.not. igr_mhd_debug_enabled) return
+            if (t_step /= igr_mhd_debug_budget_step .or. stage /= 1) return
+
+            do ii = 1, sys_size
+                state(ii) = real(q_cons_vf(ii)%sf(igr_mhd_debug_target_j, igr_mhd_debug_target_k, &
+                    & igr_mhd_debug_target_l), wp)
+                delta(ii) = dt*real(rhs_vf(ii)%sf(igr_mhd_debug_target_j, igr_mhd_debug_target_k, &
+                    & igr_mhd_debug_target_l), wp)
+                updated(ii) = state(ii) + delta(ii)
+                write (*,*) 'MHD_COMPARE BUDGET_CUM_VAR', trim(label), idir, ii, state(ii), delta(ii), updated(ii)
+            end do
+
+            call s_igr_mhd_budget_margin(updated, rho, kinetic, magnetic, margin)
+            write (*,*) 'MHD_COMPARE BUDGET_CUM', trim(label), idir, t_step, stage, &
+                & rho, updated(eqn_idx%E), kinetic, magnetic, margin
+
+        end subroutine s_igr_mhd_diagnose_budget_rhs
+
+        subroutine s_igr_mhd_budget_margin(state, rho, kinetic, magnetic, margin)
+
+            real(wp), dimension(sys_size), intent(in) :: state
+            real(wp), intent(out)                      :: rho, kinetic, magnetic, margin
+            integer                                    :: ii
+
+            rho = 0._wp
+            do ii = eqn_idx%cont%beg, eqn_idx%cont%end
+                rho = rho + state(ii)
+            end do
+
+            kinetic = 0._wp
+            do ii = eqn_idx%mom%beg, eqn_idx%mom%end
+                kinetic = kinetic + 0.5_wp*state(ii)**2._wp/rho
+            end do
+
+            magnetic = 0._wp
+            do ii = eqn_idx%B%beg, eqn_idx%B%end
+                magnetic = magnetic + 0.5_wp*state(ii)**2._wp
+            end do
+
+            margin = state(eqn_idx%E) - kinetic - magnetic
+
+        end subroutine s_igr_mhd_budget_margin
+    #:endif
 
     !> Accumulate advection source contributions from a given coordinate direction into the RHS
     subroutine s_compute_advection_source_term(idir, rhs_vf, q_cons_vf, q_prim_vf, flux_src_n_vf)
@@ -1627,7 +2178,15 @@ contains
         integer :: i, j, k, l
 
         if (igr) then
-            call s_igr_reconstruct_fixed_coeff_boundary_values(iv, v_vf, vL_x, vR_x, norm_dir)
+            #:if MFC_CASE_OPTIMIZATION and mhd
+                if (igr_mhd_debug_first_order) then
+                    call s_igr_reconstruct_first_order_boundary_values(v_vf, vL_x, vR_x, norm_dir)
+                else
+                    call s_igr_reconstruct_fixed_coeff_boundary_values(iv, v_vf, vL_x, vR_x, norm_dir)
+                end if
+            #:else
+                call s_igr_reconstruct_fixed_coeff_boundary_values(iv, v_vf, vL_x, vR_x, norm_dir)
+            #:endif
             return
         end if
 
@@ -1654,6 +2213,60 @@ contains
         #:endfor
 
     end subroutine s_reconstruct_cell_boundary_values
+
+    !> Piecewise-constant IGR reconstruction control. Unlike the legacy generic
+    !! first-order helper below, this explicitly fills both states at every
+    !! periodic-domain interface used by the shared Riemann-solver path.
+    subroutine s_igr_reconstruct_first_order_boundary_values(v_vf, vL_x, vR_x, norm_dir)
+
+        type(scalar_field), dimension(iv%beg:iv%end), intent(in) :: v_vf
+        real(wp), dimension(idwbuff(1)%beg:,idwbuff(2)%beg:,idwbuff(3)%beg:,1:), intent(inout) :: vL_x
+        real(wp), dimension(idwbuff(1)%beg:,idwbuff(2)%beg:,idwbuff(3)%beg:,1:), intent(inout) :: vR_x
+        integer, intent(in) :: norm_dir
+        integer :: i, j, k, l
+
+        if (norm_dir == 1) then
+            $:GPU_PARALLEL_LOOP(collapse=4)
+            do i = iv%beg, iv%end
+                do l = 0, p
+                    do k = 0, n
+                        do j = -1, m
+                            vL_x(j + 1, k, l, i) = v_vf(i)%sf(j + 1, k, l)
+                            vR_x(j, k, l, i) = v_vf(i)%sf(j, k, l)
+                        end do
+                    end do
+                end do
+            end do
+            $:END_GPU_PARALLEL_LOOP()
+        else if (norm_dir == 2) then
+            $:GPU_PARALLEL_LOOP(collapse=4)
+            do i = iv%beg, iv%end
+                do l = 0, p
+                    do k = -1, n
+                        do j = 0, m
+                            vL_x(j, k + 1, l, i) = v_vf(i)%sf(j, k + 1, l)
+                            vR_x(j, k, l, i) = v_vf(i)%sf(j, k, l)
+                        end do
+                    end do
+                end do
+            end do
+            $:END_GPU_PARALLEL_LOOP()
+        else if (norm_dir == 3) then
+            $:GPU_PARALLEL_LOOP(collapse=4)
+            do i = iv%beg, iv%end
+                do l = -1, p
+                    do k = 0, n
+                        do j = 0, m
+                            vL_x(j, k, l + 1, i) = v_vf(i)%sf(j, k, l + 1)
+                            vR_x(j, k, l, i) = v_vf(i)%sf(j, k, l)
+                        end do
+                    end do
+                end do
+            end do
+            $:END_GPU_PARALLEL_LOOP()
+        end if
+
+    end subroutine s_igr_reconstruct_first_order_boundary_values
 
     !> Perform first-order (piecewise constant) reconstruction of left and right cell-boundary values
     subroutine s_reconstruct_cell_boundary_values_first_order(v_vf, vL_x, vR_x, norm_dir)

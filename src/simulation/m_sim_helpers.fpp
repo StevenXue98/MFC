@@ -102,17 +102,10 @@ contains
             call s_convert_species_to_mixture_variables_acc(rho, gamma, pi_inf, qv, alpha, alpha_rho, Re)
         end if
 
-        if (igr) then
-            $:GPU_LOOP(parallelism='[seq]')
-            do i = 1, num_vels
-                vel(i) = q_prim_vf(eqn_idx%cont%end + i)%sf(j, k, l)/rho
-            end do
-        else
-            $:GPU_LOOP(parallelism='[seq]')
-            do i = 1, num_vels
-                vel(i) = q_prim_vf(eqn_idx%cont%end + i)%sf(j, k, l)
-            end do
-        end if
+        $:GPU_LOOP(parallelism='[seq]')
+        do i = 1, num_vels
+            vel(i) = q_prim_vf(eqn_idx%cont%end + i)%sf(j, k, l)
+        end do
 
         vel_sum = 0._wp
         $:GPU_LOOP(parallelism='[seq]')
@@ -120,13 +113,8 @@ contains
             vel_sum = vel_sum + vel(i)**2._wp
         end do
 
-        if (igr) then
-            E = q_prim_vf(eqn_idx%E)%sf(j, k, l)
-            pres = (E - pi_inf - qv - 5.e-1_wp*rho*vel_sum)/gamma
-        else
-            pres = q_prim_vf(eqn_idx%E)%sf(j, k, l)
-            E = gamma*pres + pi_inf + 5.e-1_wp*rho*vel_sum + qv
-        end if
+        pres = q_prim_vf(eqn_idx%E)%sf(j, k, l)
+        E = gamma*pres + pi_inf + 5.e-1_wp*rho*vel_sum + qv
 
         ! Adjust energy for hyperelasticity
         if (hyperelasticity) then

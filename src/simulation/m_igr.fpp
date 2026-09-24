@@ -14,6 +14,9 @@ module m_igr
     use m_mpi_proxy
     use m_helper
     use m_boundary_common
+    #:if MFC_CASE_OPTIMIZATION and igr and mhd
+        use ieee_arithmetic, only: ieee_is_finite
+    #:endif
 
     implicit none
 
@@ -21,6 +24,9 @@ module m_igr
         & s_igr_reconstruct_cell_boundary_values, s_igr_reconstruct_cell_boundary_values_visc_deriv, s_igr_riemann_solver, &
         & s_igr_sigma_x, s_igr_flux_add, s_finalize_igr_module, s_igr_correct_lf_fluxes, s_igr_sigma, &
         & s_igr_reconstruct_fixed_coeff_boundary_values
+    #:if MFC_CASE_OPTIMIZATION and igr and mhd
+        public :: s_igr_mhd_diagnose_sigma
+    #:endif
 
     !> @cond
 #ifdef __NVCOMPILER_GPU_UNIFIED_MEM
@@ -159,7 +165,9 @@ contains
         end do
         $:END_GPU_PARALLEL_LOOP()
 
-        if (p == 0) then
+        if (n == 0) then
+            alf_igr = alf_factor*dx(1)**2._wp
+        else if (p == 0) then
             alf_igr = alf_factor*max(dx(1), dy(1))**2._wp
         else
             alf_igr = alf_factor*max(dx(1), dy(1), dz(1))**2._wp
@@ -254,8 +262,10 @@ contains
                         do i = 1, num_fluids
                             rho_lx = rho_lx + real(q_cons_vf(i)%sf(j, k, l) + q_cons_vf(i)%sf(j - 1, k, l), kind=wp)/2._wp
                             rho_rx = rho_rx + real(q_cons_vf(i)%sf(j, k, l) + q_cons_vf(i)%sf(j + 1, k, l), kind=wp)/2._wp
-                            rho_ly = rho_ly + real(q_cons_vf(i)%sf(j, k, l) + q_cons_vf(i)%sf(j, k - 1, l), kind=wp)/2._wp
-                            rho_ry = rho_ry + real(q_cons_vf(i)%sf(j, k, l) + q_cons_vf(i)%sf(j, k + 1, l), kind=wp)/2._wp
+                            if (num_dims > 1) then
+                                rho_ly = rho_ly + real(q_cons_vf(i)%sf(j, k, l) + q_cons_vf(i)%sf(j, k - 1, l), kind=wp)/2._wp
+                                rho_ry = rho_ry + real(q_cons_vf(i)%sf(j, k, l) + q_cons_vf(i)%sf(j, k + 1, l), kind=wp)/2._wp
+                            end if
                             if (p > 0) then
                                 rho_lz = rho_lz + real(q_cons_vf(i)%sf(j, k, l) + q_cons_vf(i)%sf(j, k, l - 1), kind=wp)/2._wp
                                 rho_rz = rho_rz + real(q_cons_vf(i)%sf(j, k, l) + q_cons_vf(i)%sf(j, k, l + 1), kind=wp)/2._wp
@@ -263,38 +273,47 @@ contains
                             fd_coeff = fd_coeff + q_cons_vf(i)%sf(j, k, l)
                         end do
 
-                        fd_coeff = 1._wp/fd_coeff + alf_igr*((1._wp/dx(j)**2._wp)*(1._wp/rho_lx + 1._wp/rho_rx) + (1._wp/dy(k) &
-                                                             & **2._wp)*(1._wp/rho_ly + 1._wp/rho_ry))
+                        fd_coeff = 1._wp/fd_coeff + alf_igr*(1._wp/dx(j)**2._wp)*(1._wp/rho_lx + 1._wp/rho_rx)
 
-                        if (num_dims == 3) then
+                        if (num_dims > 1) then
+                            fd_coeff = fd_coeff + alf_igr*(1._wp/dy(k)**2._wp)*(1._wp/rho_ly + 1._wp/rho_ry)
+                        end if
+
+                        if (num_dims > 2) then
                             fd_coeff = fd_coeff + alf_igr*(1._wp/dz(l)**2._wp)*(1._wp/rho_lz + 1._wp/rho_rz)
                         end if
 
                         if (igr_iter_solver == 1) then  ! Jacobi iteration
-                            if (num_dims == 3) then
-                                jac(j, k, l) = real((alf_igr/fd_coeff)*((1._wp/dx(j)**2._wp)*(jac_old(j - 1, k, &
-                                    & l)/rho_lx + jac_old(j + 1, k, l)/rho_rx) + (1._wp/dy(k)**2._wp)*(jac_old(j, k - 1, &
-                                    & l)/rho_ly + jac_old(j, k + 1, l)/rho_ry) + (1._wp/dz(l)**2._wp)*(jac_old(j, k, &
-                                    & l - 1)/rho_lz + jac_old(j, k, l + 1)/rho_rz)) + real(jac_rhs(j, k, l), kind=wp)/fd_coeff, &
-                                    & kind=stp)
-                            else
+                            if (num_dims == 1) then
+                                jac(j, k, l) = real((alf_igr/fd_coeff)*(1._wp/dx(j)**2._wp)*(jac_old(j - 1, k, l)/rho_lx + &
+                                    & jac_old(j + 1, k, l)/rho_rx) + real(jac_rhs(j, k, l), kind=wp)/fd_coeff, kind=stp)
+                            else if (num_dims == 2) then
                                 jac(j, k, l) = real((alf_igr/fd_coeff)*((1._wp/dx(j)**2._wp)*(real(jac_old(j - 1, k, l), &
                                     & kind=wp)/rho_lx + real(jac_old(j + 1, k, l), &
                                     & kind=wp)/rho_rx) + (1._wp/dy(k)**2._wp)*(real(jac_old(j, k - 1, l), &
                                     & kind=wp)/rho_ly + real(jac_old(j, k + 1, l), kind=wp)/rho_ry)) + real(jac_rhs(j, k, l), &
                                     & kind=wp)/fd_coeff, kind=stp)
+                            else
+                                jac(j, k, l) = real((alf_igr/fd_coeff)*((1._wp/dx(j)**2._wp)*(jac_old(j - 1, k, &
+                                    & l)/rho_lx + jac_old(j + 1, k, l)/rho_rx) + (1._wp/dy(k)**2._wp)*(jac_old(j, k - 1, &
+                                    & l)/rho_ly + jac_old(j, k + 1, l)/rho_ry) + (1._wp/dz(l)**2._wp)*(jac_old(j, k, &
+                                    & l - 1)/rho_lz + jac_old(j, k, l + 1)/rho_rz)) + real(jac_rhs(j, k, l), kind=wp)/fd_coeff, &
+                                    & kind=stp)
                             end if
                         else  ! Gauss Seidel iteration
-                            if (num_dims == 3) then
+                            if (num_dims == 1) then
+                                jac(j, k, l) = real((alf_igr/fd_coeff)*(1._wp/dx(j)**2._wp)*(jac(j - 1, k, l)/rho_lx + &
+                                    & jac(j + 1, k, l)/rho_rx) + real(jac_rhs(j, k, l), kind=wp)/fd_coeff, kind=stp)
+                            else if (num_dims == 2) then
+                                jac(j, k, l) = real((alf_igr/fd_coeff)*((1._wp/dx(j)**2._wp)*(jac(j - 1, k, &
+                                    & l)/rho_lx + jac(j + 1, k, l)/rho_rx) + (1._wp/dy(k)**2._wp)*(jac(j, k - 1, &
+                                    & l)/rho_ly + jac(j, k + 1, l)/rho_ry)) + real(jac_rhs(j, k, l), kind=wp)/fd_coeff, kind=stp)
+                            else
                                 jac(j, k, l) = real((alf_igr/fd_coeff)*((1._wp/dx(j)**2._wp)*(jac(j - 1, k, &
                                     & l)/rho_lx + jac(j + 1, k, l)/rho_rx) + (1._wp/dy(k)**2._wp)*(jac(j, k - 1, &
                                     & l)/rho_ly + jac(j, k + 1, l)/rho_ry) + (1._wp/dz(l)**2._wp)*(jac(j, k, &
                                     & l - 1)/rho_lz + jac(j, k, l + 1)/rho_rz)) + real(jac_rhs(j, k, l), kind=wp)/fd_coeff, &
                                     & kind=stp)
-                            else
-                                jac(j, k, l) = real((alf_igr/fd_coeff)*((1._wp/dx(j)**2._wp)*(jac(j - 1, k, &
-                                    & l)/rho_lx + jac(j + 1, k, l)/rho_rx) + (1._wp/dy(k)**2._wp)*(jac(j, k - 1, &
-                                    & l)/rho_ly + jac(j, k + 1, l)/rho_ry)) + real(jac_rhs(j, k, l), kind=wp)/fd_coeff, kind=stp)
                             end if
                         end if
                     end do
@@ -3826,7 +3845,20 @@ contains
         real(wp), intent(out)                     :: pres_L, pres_R, cfl
         real(wp)                                  :: a_L, a_R
 
-        if (num_dims == 2) then
+        if (num_dims == 1) then
+            pres_L = (E_L - pi_inf_L - 0.5_wp*rho_L*vel_L(1)**2._wp)/gamma_L
+            pres_R = (E_R - pi_inf_R - 0.5_wp*rho_R*vel_R(1)**2._wp)/gamma_R
+
+            if (igr_pres_lim) then
+                pres_L = max(pres_L, 0._wp)
+                pres_R = max(pres_R, 0._wp)
+            end if
+
+            a_L = sqrt((pres_L*(1._wp/gamma_L + 1._wp) + pi_inf_L/gamma_L)/rho_L)
+            a_R = sqrt((pres_R*(1._wp/gamma_R + 1._wp) + pi_inf_R/gamma_R)/rho_R)
+
+            cfl = max(abs(vel_L(1)), abs(vel_R(1))) + max(a_L, a_R)
+        else if (num_dims == 2) then
             pres_L = (E_L - pi_inf_L - 0.5_wp*rho_L*(vel_L(1)**2._wp + vel_L(2)**2._wp))/gamma_L
             pres_R = (E_R - pi_inf_R - 0.5_wp*rho_R*(vel_R(1)**2._wp + vel_R(2)**2._wp))/gamma_R
 
@@ -3906,6 +3938,48 @@ contains
         end if
 
     end subroutine s_igr_flux_add
+
+    #:if MFC_CASE_OPTIMIZATION and igr and mhd
+        ! Opt-in one-rank CPU diagnostic for MHD comparison experiments.
+        subroutine s_igr_mhd_diagnose_sigma(t_step, stage, diag_start, diag_stop)
+
+            integer, intent(in) :: t_step, stage, diag_start, diag_stop
+            integer :: ii, jj, kk, min_j, min_k, min_l, max_j, max_k, max_l, nonfinite
+            real(wp) :: sigma_min, sigma_max, sigma
+
+            if (t_step < diag_start .or. t_step > diag_stop) return
+
+            sigma_min = huge(0._wp)
+            sigma_max = -huge(0._wp)
+            nonfinite = 0
+            min_j = 0; min_k = 0; min_l = 0
+            max_j = 0; max_k = 0; max_l = 0
+
+            do kk = 0, p
+                do jj = 0, n
+                    do ii = 0, m
+                        sigma = jac(ii, jj, kk)
+                        if (.not. ieee_is_finite(sigma)) then
+                            nonfinite = nonfinite + 1
+                        else
+                            if (sigma < sigma_min) then
+                                sigma_min = sigma
+                                min_j = ii; min_k = jj; min_l = kk
+                            end if
+                            if (sigma > sigma_max) then
+                                sigma_max = sigma
+                                max_j = ii; max_k = jj; max_l = kk
+                            end if
+                        end if
+                    end do
+                end do
+            end do
+
+            write (*,*) 'MHD_COMPARE SIGMA', t_step, stage, sigma_min, min_j, min_k, min_l, &
+                & sigma_max, max_j, max_k, max_l, nonfinite
+
+        end subroutine s_igr_mhd_diagnose_sigma
+    #:endif
 
     !> Finalize the IGR module
     subroutine s_finalize_igr_module()

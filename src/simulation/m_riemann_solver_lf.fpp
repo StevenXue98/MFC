@@ -316,7 +316,13 @@ contains
                             s_L = sqrt(s_L)
                             s_R = sqrt(s_R)
 
-                            s_P = max(s_L, s_R) + max(c_L, c_R)
+                            if (mhd) then
+                                ! The LF spectral bound must include the fast magnetosonic wave family.
+                                s_P = max(s_L, s_R) + max(c_fast%L, c_fast%R)
+                                if (hyper_cleaning) s_P = max(s_P, hyper_cleaning_speed)
+                            else
+                                s_P = max(s_L, s_R) + max(c_L, c_R)
+                            end if
                             s_M = -s_P
 
                             s_L = s_M
@@ -467,10 +473,26 @@ contains
                                     $:GPU_LOOP(parallelism='[seq]')
                                     do i = 0, 2
                                         flux_rsx_vf(${SF('')}$, &
-                                                    & eqn_idx%B%beg + i) = (1 - dir_flg(i + 1))*(s_M*(vel_R(dir_idx(1))*B%R(i + 1) &
+                                                    & eqn_idx%B%beg + i) = (s_M*(vel_R(dir_idx(1))*B%R(i + 1) &
                                                     & - vel_R(i + 1)*B%R(norm_dir)) - s_P*(vel_L(dir_idx(1))*B%L(i + 1) - vel_L(i &
                                                     & + 1)*B%L(norm_dir)) + s_M*s_P*(B%L(i + 1) - B%R(i + 1)))/(s_M - s_P)
                                     end do
+
+                                    if (hyper_cleaning) then
+                                        ! Rusanov flux for the GLM subsystem:
+                                        ! d_t B_normal + d_normal psi = 0 and
+                                        ! d_t psi + c_h^2 d_normal B_normal = 0.
+                                        flux_rsx_vf(${SF('')}$, eqn_idx%B%beg + norm_dir - 1) = flux_rsx_vf(${SF('')}$, &
+                                                    & eqn_idx%B%beg + norm_dir - 1) + (s_M*qR_prim_rsx_vf(${SF(' + 1')}$, &
+                                                    & eqn_idx%psi) - s_P*qL_prim_rsx_vf(${SF('')}$, eqn_idx%psi))/(s_M - s_P)
+
+                                        flux_rsx_vf(${SF('')}$, &
+                                                    & eqn_idx%psi) = (hyper_cleaning_speed**2*(s_M*B%R(norm_dir) &
+                                                    & - s_P*B%L(norm_dir)) + s_M*s_P*(qL_prim_rsx_vf(${SF('')}$, &
+                                                    & eqn_idx%psi) - qR_prim_rsx_vf(${SF(' + 1')}$, eqn_idx%psi)))/(s_M - s_P)
+                                    else
+                                        flux_rsx_vf(${SF('')}$, eqn_idx%B%beg + norm_dir - 1) = 0._wp
+                                    end if
                                 end if
                                 flux_src_rsx_vf(${SF('')}$, eqn_idx%adv%beg) = 0._wp
                             end if

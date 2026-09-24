@@ -462,13 +462,7 @@ contains
 
             if (s == 1) then
                 if (run_time_info) then
-                    ! IGR runtime information still uses conservative variables until primitive workspaces are fully integrated
-                    if (igr) then
-                        call s_write_run_time_information(q_cons_ts(1)%vf, t_step)
-                    end if
-                    if (.not. igr) then
-                        call s_write_run_time_information(q_prim_vf, t_step)
-                    end if
+                    call s_write_run_time_information(q_prim_vf, t_step)
                 end if
 
                 if (probe_wrt) then
@@ -629,20 +623,13 @@ contains
         integer                :: j, k, l  !< Generic loop iterators
         integer                :: fl       !< Fluid loop iterator
 
-        ! IGR dt calculation still uses its custom conservative-variable path.
-        if (.not. igr) then
-            call s_convert_conservative_to_primitive_variables(q_cons_ts(1)%vf, q_T_sf, q_prim_vf, idwint)
-        end if
+        call s_convert_conservative_to_primitive_variables(q_cons_ts(1)%vf, q_T_sf, q_prim_vf, idwint)
 
         $:GPU_PARALLEL_LOOP(collapse=3, private='[vel, alpha, Re, rho, vel_sum, pres, gamma, pi_inf, c, H, qv, fl]')
         do l = 0, p
             do k = 0, n
                 do j = 0, m
-                    if (igr) then
-                        call s_compute_enthalpy(q_cons_ts(1)%vf, pres, rho, gamma, pi_inf, Re, H, alpha, vel, vel_sum, qv, j, k, l)
-                    else
-                        call s_compute_enthalpy(q_prim_vf, pres, rho, gamma, pi_inf, Re, H, alpha, vel, vel_sum, qv, j, k, l)
-                    end if
+                    call s_compute_enthalpy(q_prim_vf, pres, rho, gamma, pi_inf, Re, H, alpha, vel, vel_sum, qv, j, k, l)
 
                     ! Compute mixture sound speed
                     call s_compute_speed_of_sound(pres, rho, gamma, pi_inf, H, alpha, vel_sum, 0._wp, c, qv)
